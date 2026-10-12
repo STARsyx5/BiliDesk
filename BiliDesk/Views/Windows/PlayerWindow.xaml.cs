@@ -755,6 +755,11 @@ public partial class PlayerWindow : FluentWindow
         // 清掉屏幕上残留的弹幕(防泄漏)并重置泳道占用
         DanmakuCanvas.Children.Clear();
         ResetLanes();
+        // ★ 收起把手的显隐要重新摆一次(2026-10-12 新增)。_controlsHidden 是"每片状态"
+        //   (登记在 PerMediaStateFields 里), 换片时被清成 false, 但上一片隐藏时按钮已经
+        //   被 Collapse 了 —— 不同步一次的话, 换片后把手会一直消失到下一次鼠标移动
+        //   (控制栏本身有"鼠标一动就恢复"兜底, 把手可没有那条路)。
+        ApplyCollapseHandleVisibility();
         TimeText.Text = "00:00 / 00:00";
         ProgressSlider.Value = 0;
         // 新片子当然还没播完: 清掉结尾状态与"重播"遮罩, 否则切下一条视频时会挂着上一段的遮罩
@@ -2138,7 +2143,9 @@ public partial class PlayerWindow : FluentWindow
         _volumeCache = v;
         // 与 SetVolume 里同一行: 滑块是独立入口(不经 SetVolume, 避免回环), 持久化不能少。
         // 拖动时每个 tick 都会调一次 —— Save 是合并异步写, 连拖只落盘一次(见 SettingsStore.Save)。
-        Svc.Settings.SetDefaultVolume(v);
+        // ★ 第二个参数 this = "是本窗口调的": 多窗口下别的窗口不该被这个写入牵着走
+        //   (见 SettingsStore.VolumeChanged 关于 origin 的说明)。
+        Svc.Settings.SetDefaultVolume(v, this);
         // seek 静音期间(与 SetVolume 同一套约定): 新值记为恢复目标, 声音保持静音直到画面就绪。
         // 这里不能直接写 _mp.Volume —— 否则拖一下滑块就绕过静音, 声音又跑到画面前面去了。
         if (_seekMuteSavedVolume >= 0)
@@ -2154,10 +2161,16 @@ public partial class PlayerWindow : FluentWindow
     /// 设置页改了默认音量: 正在播的立刻应用。
     /// 走 <see cref="SetVolume"/> 统一入口(OSD/滑块/seek 静音语义全带上); 它内部的持久化
     /// 回写是同值短路(见 SettingsStore.SetDefaultVolume), 不会连环触发事件。
+    ///
+    /// ★ origin 必须**原样传进来**(2026-10-12 审查抓到的多窗口串音 bug):
+    ///   多窗口下 origin 非 null = "是别的窗口自己调的音量", 那只是它写回了个跨窗口偏好,
+    ///   本窗口的音量不该跟着动 —— 漏判这一句就是"在 B 里调音量、A 也跟着变"。
+    ///   真正的"设置页改音量"(origin == null)才是用户要求所有窗口立刻生效的那一次。
     /// </summary>
-    private void OnVolumeSettingChanged()
+    private void OnVolumeSettingChanged(PlayerWindow? origin)
     {
         if (_closing) return;
+        if (origin != null && !ReferenceEquals(origin, this)) return;
         SetVolume(Svc.Settings.DefaultVolume);
     }
 
@@ -2225,9 +2238,12 @@ public partial class PlayerWindow : FluentWindow
     private int _volumeCache = 80;
 
     /// <summary>
-    /// 静音前的音量(M 键的恢复目标)。跟着 <see cref="_volumeCache"/> 一起变, 但只在按 M
-    /// 静音的那一刻定格 —— 之后用户用滚轮/滑块改音量都不影响它, 直到下次静音时重新定格。
-    /// 窗口级字段(换片不重置, 见 <see cref="PersistentFields"/>): 恢复目标与"正在看第几集"无关。
+    /// 最近一次**非零**音量 —— M 键取消静音的恢复目标(2026-10-12: 定格点移进 SetVolume,
+    /// 让滑块/方向键降到 0 的路径也能覆盖到, 而不只 M 键那条)。
+    ///
+    /// ★ 它是**纯窗口级字段, 不落盘**(登记在 <see cref="PersistentFields"/> 里, 但两个
+    ///   设置项都没有对应项)。所以"上次退出前听着 30 → 重开按 M"回不到 30, 会走兜底 80 ——
+    ///   要跨次恢复得另加一个设置字段, 现在没这个需求就别假装有。
     /// </summary>
     private int _preMuteVolume;
 
@@ -2242,11 +2258,18 @@ public partial class PlayerWindow : FluentWindow
         var v = Math.Max(0, Math.Min(100, volume));
         // 权威值先落账: 之后所有路径(滚轮/键盘)都以它为基数, 不依赖原生读回(见 _volumeCache 的说明)
         _volumeCache = v;
+        // ★ 最近一次**非零**音量在这里定格(2026-10-12 审查抓到): M 键取消静音要回到它。
+        //   放在统一入口而不是只放在 Key.M 分支里 —— 用户把音量用滑块/方向键降到 0
+        //   (根本没按过 M)时, 只在 M 里定格的写法会让 _preMuteVolume 停在初值 0,
+        //   于是按 M 跳到写死的 80, 而不是用户刚才还在听的音量。
+        if (v > 0) _preMuteVolume = v;
         // 持久化: 这一行同时承担"设置页默认音量"与"播放器音量记忆"两个语义(见 SettingsStore.DefaultVolume)。
         // 放在 _volumeCache 落账之后、下面两条 return 之前: seek 静音期间用户调音量时 _volumeCache 记的
         // 是"恢复目标", 那也正是用户想记住的值; 放后面会被"静音中"和"原生写失败"两条 return 漏掉。
         // SetDefaultVolume 内部有同值短路, 程序性回写不会产生额外落盘, 也不需要调用方判重。
-        Svc.Settings.SetDefaultVolume(v);
+        // ★ 第二个参数 this = "是本窗口调的": 多窗口下别的窗口不该被这个写入牵着走
+        //   (见 SettingsStore.VolumeChanged 关于 origin 的说明)。
+        Svc.Settings.SetDefaultVolume(v, this);
         // seek 静音期间用户调音量: 把新值记为"恢复目标", 声音仍保持静音直到画面就绪 ——
         // 若直接写 _mp.Volume 会立刻出声(又变成画面没到声音先到), 而且恢复时还会覆盖用户的值。
         if (_seekMuteSavedVolume >= 0)
@@ -2622,6 +2645,14 @@ public partial class PlayerWindow : FluentWindow
     /// </summary>
     private void OnVideoAreaMouseLeftDown(object sender, MouseButtonEventArgs e)
     {
+        // ★ 收起把手必须**先于**边缘缩放判定(2026-10-12 审查抓到的"点把手变成拖窗口"):
+        //   收起详情栏后视频铺满整个窗口宽度, 把手(Width=18) 就贴在窗口右缘上,
+        //   而边缘缩放带(ResizeEdgeDip=6)判的也是这条右缘 —— 最外侧 6px 正好被两边抢,
+        //   按下时先跑进 TryBeginEdgeResize 就进了系统模态缩放循环, 把手点了没反应。
+        //   把手优先之后, 缩放带仍可从把手上/下方拖(那里不在带内), 右缘整体照样能拖。
+        //   (Up 里同一道守卫见 OnVideoAreaMouseLeftUp —— Down/Up 必须对称。)
+        if (BtnCollapsePanel != null && BtnCollapsePanel.IsMouseOver) return;
+
         // 落在窗口边缘缩放带里的按下是"拖边缘改大小", 不算视频区手势(见 TryBeginEdgeResize)
         if (TryBeginEdgeResize()) { e.Handled = true; return; }
         if (_mp == null) return;
@@ -2632,11 +2663,7 @@ public partial class PlayerWindow : FluentWindow
         // 跳过提示条上的点击(「撤回」按钮)同样不算视频区手势 ——
         // 它是覆盖层里除了控制栏之外唯一会吃掉左键的自绘元素, 不挡住就会"点撤回顺带切一次播放/暂停"。
         if (SkipNoticeBorder != null && SkipNoticeBorder.IsMouseOver) return;
-        // 右缘的收起把手同理(2026-10-12 新增): 它和上面几个一样会吃掉左键, 不挡的话
-        // "点把手收详情"会顺带暂停一次。
-        // ★ 必须挡: 本方法是 **Preview**(隧道)事件, 挂在 VideoAreaRoot 上会**先于**按钮
-        //   自己收到点击 —— 按钮内部标 Handled 也拦不住已经路过的隧道事件。
-        if (BtnCollapsePanel != null && BtnCollapsePanel.IsMouseOver) return;
+        // (收起把手的守卫在方法最前面, 因为它还要抢在边缘缩放判定之前 —— 见那里的说明。)
 
         // 双击: 立即全屏, 取消所有挂起的单击/长按动作, 并抑制后续 Up 的单击排队
         if (e.ClickCount >= 2)
@@ -2671,14 +2698,19 @@ public partial class PlayerWindow : FluentWindow
     /// <summary>视频区左键松开: 若是长按 → 恢复 1x; 否则延迟触发播放/暂停(给双击留窗口)</summary>
     private void OnVideoAreaMouseLeftUp(object sender, MouseButtonEventArgs e)
     {
+        // ★ 长按收尾必须放在下面三道守卫**之前**(2026-10-12 审查抓到的 2x 卡死):
+        //   守卫会直接 return, 于是"按住视频区快进后把指针滑到把手上松手"这条路
+        //   既没停 _longPressTimer, 也没走到恢复 1x 的分支 —— 视频就一直卡在 2x,
+        //   要等下一次按下或鼠标离开才复位。把手紧贴视频右缘, 正是长按后顺手滑过去的落点。
+        //   三道守卫(控制栏/跳过提示/收起把手)只是"别顺手暂停", 与倍速恢复无关, 不该拦住它。
+        _longPressTimer?.Stop();
+
         // 与 Down 对称: 控制栏上的点击不触发单击暂停
         if (ControlBar != null && ControlBar.IsMouseOver) return;
         // 与 Down 对称: 跳过提示条上的「撤回」点击也不触发单击暂停
         if (SkipNoticeBorder != null && SkipNoticeBorder.IsMouseOver) return;
         // 与 Down 对称: 右缘收起把手的点击不触发单击暂停(见 Down 里同名的说明)
         if (BtnCollapsePanel != null && BtnCollapsePanel.IsMouseOver) return;
-
-        _longPressTimer?.Stop();
 
         // 双击已被 Down 处理过(全屏), 这里直接吞掉, 绝不能再排一次播放/暂停
         if (_suppressSingleClick)
@@ -2778,6 +2810,25 @@ public partial class PlayerWindow : FluentWindow
         _controlsHideTimer.Start();
     }
 
+    /// <summary>
+    /// 收起把手的显隐。**唯一**改它 Visibility 的地方(2026-10-12 审查新增)。
+    ///
+    /// ★ 为什么要单独一个入口, 而不在 ApplyInfoPanelState 里顺手写:
+    ///   它要跟着**两个互不相关**的状态走 ——
+    ///     · 全屏: 全屏时信息栏被强制收起, 把手点了没有任何画面变化(且会留"_isFillWindow
+    ///       被悄悄改掉"的隐患) ⇒ 必须藏;
+    ///     · 控制栏自动隐藏: 播放中控制栏淡出、鼠标隐藏, 沉浸模式就该彻底; 把手还常驻可见
+    ///       且吃掉鼠标、光标还从"无光标"突变成手型(审查抓到的沉浸模式破损)。
+    ///   两个条件由 HideControls/ShowControls 与 ApplyInfoPanelState 分别触发, 各写一份
+    ///   就会出现"全屏退出了把手却没回来"这类状态打架。
+    /// </summary>
+    private void ApplyCollapseHandleVisibility()
+    {
+        if (_closing || BtnCollapsePanel == null) return;
+        var visible = !_isFullscreen && !_controlsHidden;
+        BtnCollapsePanel.Visibility = visible ? Visibility.Visible : Visibility.Collapsed;
+    }
+
     private void HideControls()
     {
         if (_controlsHidden || _closing) return;
@@ -2785,6 +2836,8 @@ public partial class PlayerWindow : FluentWindow
         _controlsHideTimer?.Stop();
         ControlBar.IsHitTestVisible = false;   // 隐形时不能再吃视频区的点击/滚轮
         VideoAreaRoot.Cursor = System.Windows.Input.Cursors.None;
+        // 把手跟控制栏一起退场(见 ApplyCollapseHandleVisibility)
+        ApplyCollapseHandleVisibility();
         var fade = new System.Windows.Media.Animation.DoubleAnimation(1, 0,
             TimeSpan.FromMilliseconds(180))
         { FillBehavior = System.Windows.Media.Animation.FillBehavior.Stop };
@@ -2795,6 +2848,7 @@ public partial class PlayerWindow : FluentWindow
     private void ShowControls()
     {
         _controlsHideTimer?.Stop();
+        ApplyCollapseHandleVisibility();
         if (!_controlsHidden)
         {
             // 没藏着也要确保可见(动画/其它路径可能把透明度留成中间值)
@@ -3438,12 +3492,15 @@ public partial class PlayerWindow : FluentWindow
             // 基数用 _volumeCache: aout 未就绪时 _mp.Volume 原生读回是 -1/旧值(见 _volumeCache 的说明)
             case Key.Up: SetVolume(_volumeCache + VolumeStep); e.Handled = true; return;
             case Key.Down: SetVolume(_volumeCache - VolumeStep); e.Handled = true; return;
-            // M: 静音 / 取消静音。恢复值取"静音前听着的那个音量"(_preMuteVolume, 它跟着音量一起
-            // 被持久化过) —— ★ 别恢复成写死的 80: 用户明明在 30 听, 静音再取消应该回 30。
-            // 兜底 80 只发生在"窗口打开时就带着 0(上次退出停在静音)、且本窗口还没调过音量":
-            // 这时 _preMuteVolume 是 0, 给一个听得见的默认值比"按了没反应"好。
+            // M: 静音 / 取消静音。恢复值取"最近一次非零音量"(_preMuteVolume) ——
+            //   ★ 别恢复成写死的 80: 用户明明在 30 听, 静音再取消应该回 30。
+            //   兜底 80 只发生在"窗口打开时就带着 0(上次退出停在静音)、且本窗口还没调过音量":
+            //   这时 _preMuteVolume 是 0, 给一个听得见的默认值比"按了没反应"好。
+            // ★ 不要再在这里给 _preMuteVolume 定格: SetVolume 统一入口已经做了
+            //   (滑块/方向键降到 0 那条路径不经过这个分支, 在这里定格会漏)。
+            // ★ _preMuteVolume 是**窗口级字段、不落盘**(见它的声明): 跨窗口/跨次启动
+            //   恢复不了, 兜底 80 正是为这种场合留的。
             case Key.M:
-                if (_volumeCache > 0) _preMuteVolume = _volumeCache;
                 SetVolume(_volumeCache == 0 ? (_preMuteVolume > 0 ? _preMuteVolume : 80) : 0);
                 e.Handled = true; return;
             case Key.F: if ((Keyboard.Modifiers & ModifierKeys.Control) == ModifierKeys.None) ToggleFullscreen(); e.Handled = true; return;
@@ -3917,13 +3974,10 @@ public partial class PlayerWindow : FluentWindow
         MinWidth = hide ? FillWindowMinWidth : NormalWindowMinWidth;
         MinHeight = hide ? FillWindowMinHeight : NormalWindowMinHeight;
 
-        // ★ 视频区右缘的收起把手(2026-10-12 新增): **只**在全屏时藏掉。
-        //   全屏会把信息栏强制收起(见 ApplyFullscreenLayout), 这时候点把手只会改
-        //   _isFillWindow 而不改变画面, 退全屏时信息栏却不会回来 —— 一个"看着没反应
-        //   还留后患"的按钮, 不如藏掉。窗口模式下两种状态都显示: 收起态箭头朝右(›),
-        //   正是"把它放回来"的入口, 不能一起藏。
-        if (BtnCollapsePanel != null)
-            BtnCollapsePanel.Visibility = _isFullscreen ? Visibility.Collapsed : Visibility.Visible;
+        // ★ 视频区右缘的收起把手: 显隐统一走 ApplyCollapseHandleVisibility(它同时看全屏与
+        //   控制栏隐藏两个状态)。这里**不要**再单独写 Visibility —— 各写一份就会出现
+        //   "退全屏了把手没回来"这类状态打架。
+        ApplyCollapseHandleVisibility();
     }
 
     /// <summary>

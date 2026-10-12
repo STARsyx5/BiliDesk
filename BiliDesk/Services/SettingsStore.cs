@@ -6,6 +6,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using BiliDesk.Helpers;
 using BiliDesk.Models;
+using BiliDesk.Views;
 
 namespace BiliDesk.Services;
 
@@ -179,11 +180,16 @@ public class SettingsStore
     public const int VolumeMax = 100;
 
     /// <summary>
-    /// 默认音量变更。两个订阅方:
-    ///   · 播放器(PlayerWindow.OnVolumeSettingChanged) —— 设置页改音量时正在播的立刻生效;
-    ///   · 设置页(SettingsViewModel) —— 播放器改音量时滑块实时跟随, 不会显示旧值。
+    /// 默认音量变更。事件参数 = **发起方**(null = 设置页, 非 null = 那个播放器窗口)。
+    ///
+    /// ★ 为什么必须带来源(2026-10-12 审查发现, 多窗口下的真 bug):
+    ///   多播放器窗口同时开着时, 每个窗口都订阅本事件。如果无脑广播, 在 B 窗口调音量 →
+    ///   写回设置 → 事件 → **A 窗口也跟着变**(两个窗口一起被调), 与
+    ///   "默认音量"这个"跨窗口偏好"的语义不符 —— 用户在 A 里听的声音不该被 B 动。
+    ///   带来源后: 设置页发起 ⇒ 广播给所有窗口(这是用户明确要求"全部生效"的);
+    ///   某个播放器发起 ⇒ 只写回设置供**下次**开窗使用, 不打扰其他窗口。
     /// </summary>
-    public event Action? VolumeChanged;
+    public event Action<PlayerWindow?>? VolumeChanged;
 
     /// <summary>
     /// 首页「推荐」用哪套算法。★ 2026-10-03 起**固定为网页版**, 该字段仅为兼容老配置保留 ——
@@ -617,20 +623,24 @@ public class SettingsStore
     }
 
     /// <summary>
-    /// 改默认音量并落盘, 广播给已打开的播放器(正在播的立刻生效)与设置页(滑块跟着动)。
+    /// 改默认音量并落盘, 广播给已打开的播放器与设置页。
     ///
-    /// ★ 同值短路不只是省磁盘: 播放器每次调音量都会调它(见 PlayerWindow.SetVolume),
-    ///   程序性回写(Playing 补写、事件触发后的同步)因此不会产生额外落盘, 调用方也不必判重。
+    /// <paramref name="origin"/> = 谁发起的这次修改(null = 设置页/外部, 非 null = 某个播放器窗口)。
+    /// ★ 它决定事件怎么被消费, 别随手传 null: 多窗口下"在 B 窗口调音量却把 A 也调了"
+    ///   就是漏传 origin 造成的(见 <see cref="VolumeChanged"/> 的说明)。播放器内部的两个
+    ///   写入点(SetVolume / OnVolumeChanged)必须传 this。
+    /// ★ 同值短路不只是省磁盘: 程序性回写(Playing 补写、事件触发后的同步)因此不会
+    ///   产生额外落盘, 也不需要调用方判重。
     /// ★ 不需要像画质那样"只影响下一次取流": 音量是即时生效的, 所以必须广播 ——
     ///   用户在设置页拖滑杆时, 正在播的视频要跟着变(与弹幕设置同款语义)。
     /// </summary>
-    public void SetDefaultVolume(int volume)
+    public void SetDefaultVolume(int volume, PlayerWindow? origin = null)
     {
         var v = Math.Clamp(volume, VolumeMin, VolumeMax);
         if (DefaultVolume == v) return;
         DefaultVolume = v;
         Save();
-        VolumeChanged?.Invoke();
+        VolumeChanged?.Invoke(origin);
     }
 
     /// <summary>
