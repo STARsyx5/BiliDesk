@@ -1143,6 +1143,21 @@ public class AppSettings
     public int PreferredQualityQn { get; set; } = QualityPreference.DefaultQn;
 
     /// <summary>
+    /// 默认音量(0~100, 默认 80)。每次打开播放器窗口时起播的音量;
+    /// 播放器里调节音量(滚轮/滑块/↑↓/M)后会写回这个值, 所以它同时承担"记住上次音量"。
+    /// ★ 默认值/范围与 Services/SettingsStore.cs 的同名属性是**读写契约**, 两处必须一致。
+    ///   老配置缺这个字段 → 反序列化保持 80 → 与升级前播放器写死的 80 一致, 体感不变。
+    /// </summary>
+    public int DefaultVolume { get; set; } = 80;
+
+    /// <summary>
+    /// 是否允许同时打开多个播放器窗口(默认 true)。开启后每次播放都新建窗口,
+    /// 已打开的继续播放; 关闭则复用同一个窗口(打开新视频会替换当前播放)。
+    /// ★ 默认值与 Services/SettingsStore.cs 的同名属性是**读写契约**, 两处必须一致。
+    /// </summary>
+    public bool MultiPlayerWindow { get; set; } = true;
+
+    /// <summary>
     /// 首页「推荐」tab 的算法来源。★ 2026-10-03 起固定为网页版(字段仅为兼容老配置保留,
     /// 读取时一律强制 Web, 见 SettingsStore.Load)。
     /// </summary>

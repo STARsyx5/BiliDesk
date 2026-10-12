@@ -580,6 +580,53 @@ public class SettingsViewModel : ObservableObject
             : $"每次起播都请求 {QualityPreference.LabelOf(Svc.Settings.PreferredQualityQn)}; " +
               "该清晰度不存在或没有权限时自动降到可用的下一档";
 
+    // ----------------- 默认音量 -----------------
+
+    /// <summary>
+    /// 默认音量(0~100)。每次打开播放器窗口时起播的音量;
+    /// 在播放器里用滚轮/滑块/↑↓/M 调过之后, 新值会写回这里 —— 所以它同时是"音量记忆"。
+    /// ★ 与画质不同, 这里可以直接绑 int: SettingsStore 有 <c>VolumeChanged</c> 事件,
+    ///   播放器里的调节会推通知回来(见构造函数里的订阅), 不存在"别处改了不刷新"的问题。
+    /// </summary>
+    public int DefaultVolume
+    {
+        get => Svc.Settings.DefaultVolume;
+        set
+        {
+            if (value == Svc.Settings.DefaultVolume) return;
+            Svc.Settings.SetDefaultVolume(value);
+        }
+    }
+
+    /// <summary>滑杆行副标题里的数值(与 DanmakuAreaText 同款)</summary>
+    public string DefaultVolumeText => DefaultVolume + "%";
+
+    /// <summary>滑杆上下限。绑 SettingsStore 的常量而不是在 XAML 里写字面量(范围只定义一处)</summary>
+    public double DefaultVolumeMin => SettingsStore.VolumeMin;
+    public double DefaultVolumeMax => SettingsStore.VolumeMax;
+
+    // ----------------- 多个播放器窗口 -----------------
+
+    /// <summary>
+    /// 是否允许同时打开多个播放器窗口。开启后每次播放都新建窗口(已打开的继续播,
+    /// 不会互相覆盖); 关闭则复用同一个窗口 —— 打开新视频会替换当前播放(旧行为)。
+    /// ★ 只影响"新窗口怎么来": 播放中改它不动已经开着的窗口(见 PlayerService.GetOrCreateWindow)。
+    /// </summary>
+    public bool MultiPlayerWindow
+    {
+        get => Svc.Settings.MultiPlayerWindow;
+        set
+        {
+            if (value == Svc.Settings.MultiPlayerWindow) return;
+            Svc.Settings.SetMultiPlayerWindow(value);
+        }
+    }
+
+    /// <summary>副标题把两种模式各自的行为写清楚 —— 这个开关的两种状态差异很大, 不写会误判</summary>
+    public string MultiPlayerWindowHint => Svc.Settings.MultiPlayerWindow
+        ? "每次播放都新建一个窗口, 已打开的视频继续播放"
+        : "复用同一个窗口, 打开新视频会替换当前播放";
+
     // ----------------- CDN(线路)设置 -----------------
     // 逻辑见 Services/CdnService.cs; 实测依据见该文件顶部注释
 
@@ -1029,6 +1076,16 @@ public class SettingsViewModel : ObservableObject
         });
 
         SessionManager.Instance.Changed += () => _ = RefreshUserAsync();
+
+        // 播放器里调音量会写回设置(见 SettingsStore.SetDefaultVolume): 设置页开着时滑杆要跟着动,
+        // 否则用户会在设置页看到一个"假"的旧值。设置页实例随主窗口缓存整个应用生命周期
+        // (见 MainWindow.PageOf 的 _pages), 订阅不退也没有泄漏问题。
+        Svc.Settings.VolumeChanged += () =>
+        {
+            OnPropertyChanged(nameof(DefaultVolume));
+            OnPropertyChanged(nameof(DefaultVolumeText));
+        };
+
         _ = RefreshUserAsync();
         UpdateCacheSizeText();
         UpdateVideoCacheSizeText();

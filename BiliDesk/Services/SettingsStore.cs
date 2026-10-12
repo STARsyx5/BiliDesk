@@ -144,6 +144,48 @@ public class SettingsStore
     public int PreferredQualityQn { get; set; } = QualityPreference.DefaultQn;
 
     /// <summary>
+    /// 默认音量(0~100)。**一个字段同时承担两件事**:
+    ///   · 设置页的「默认音量」: 每次打开播放器窗口按它起播;
+    ///   · 播放器的音量记忆: 播放中调节(滚轮/滑块/↑↓/M)写回它, 下次打开还是这个音量。
+    ///
+    /// ★ 为什么不拆成"默认音量"和"上次音量"两个字段: 用户要的行为就是"记住我调过的"——
+    ///   两个字段反而要回答"下次打开听哪个"的优先权问题, 多一个永远解释不清的状态。
+    /// ★ 默认 80 = 新增本设置之前播放器里写死的值(见 PlayerWindow 构造函数), 老用户升级后体感不变。
+    /// ★ 换片不重置: 播放器侧 _volumeCache 登记在 PersistentFields(见那里), 同一窗口连看
+    ///   几集保持当前音量; 只有开新窗口才回到这个值。
+    /// ★ 可调范围与 AppSettings.DefaultVolume 是读写契约, 只通过 <see cref="VolumeMin"/>/
+    ///   <see cref="VolumeMax"/> 一处定义(Load 兜底、setter 夹取、设置页滑杆上下限全引它)。
+    /// </summary>
+    public int DefaultVolume { get; set; } = 80;
+
+    /// <summary>
+    /// 是否允许同时打开多个播放器窗口(默认**开**)。
+    ///
+    /// · 开: 每次播放(视频/直播/本地文件)都**新建**一个播放器窗口, 已开着的窗口继续播
+    ///   各自的 —— 用户可以一边看 A 一边点开 B, 不会互相覆盖;
+    /// · 关: 复用同一个播放器窗口(旧行为), 打开新视频会替换当前播放。
+    ///
+    /// ★ 只影响"新窗口怎么来": 播放中改它不会动已经开着的窗口(下次播放才按新值走),
+    ///   所以不需要广播事件 —— 与「默认画质」同款(见 <see cref="SetPreferredQuality"/> 的说明)。
+    /// ★ 默认开的理由: 复用窗口会覆盖正在看的视频, 是用户明确不要的行为;
+    ///   想要旧行为的在设置页关掉即可(见 <see cref="SetMultiPlayerWindow"/>)。
+    /// ★ 读取点只有一个: PlayerService.GetOrCreateWindow。
+    /// </summary>
+    public bool MultiPlayerWindow { get; set; } = true;
+
+    /// <summary>音量可调范围(含)。设置页滑杆的上下限也绑这两个常量, 不与别处重复写字面量。</summary>
+    public const int VolumeMin = 0;
+    /// <inheritdoc cref="VolumeMin"/>
+    public const int VolumeMax = 100;
+
+    /// <summary>
+    /// 默认音量变更。两个订阅方:
+    ///   · 播放器(PlayerWindow.OnVolumeSettingChanged) —— 设置页改音量时正在播的立刻生效;
+    ///   · 设置页(SettingsViewModel) —— 播放器改音量时滑块实时跟随, 不会显示旧值。
+    /// </summary>
+    public event Action? VolumeChanged;
+
+    /// <summary>
     /// 首页「推荐」用哪套算法。★ 2026-10-03 起**固定为网页版**, 该字段仅为兼容老配置保留 ——
     /// 读取时丢弃、写入时固定写 Web, 代码里没有任何地方按它分支。
     ///
@@ -301,6 +343,13 @@ public class SettingsStore
         //   的值, 直接流进取流请求会变成一个谁也不认识的 qn(表现为画质莫名其妙)。
         PreferredQualityQn = QualityPreference.Normalize(s.PreferredQualityQn);
 
+        // ★ 默认音量要夹取: 老配置没有这个字段(属性初始化值 80), 手改过的可能有越界值。
+        //   不夹的话滑杆会被顶死在端点、而起播音量比端点还极端(观感与数值对不上)。
+        DefaultVolume = Math.Clamp(s.DefaultVolume, VolumeMin, VolumeMax);
+
+        // 多窗口开关: 老配置缺字段时靠属性初始化值(true), 不需要版本兼容。
+        MultiPlayerWindow = s.MultiPlayerWindow;
+
         // ★ 算法选择已删除(2026-10-03): 固定网页版, 不再从配置读 ——
         //   老配置里存着 App 的会被纠正(那一档实测对第三方客户端不提供个性化),
         //   继续"尊重"旧值就是让用户看一屏通用热门。
@@ -362,6 +411,8 @@ public class SettingsStore
         DanmakuFilterColorful = DanmakuFilterColorful,
         DanmakuFilterAdvanced = DanmakuFilterAdvanced,
         PreferredQualityQn = PreferredQualityQn,
+        DefaultVolume = DefaultVolume,
+        MultiPlayerWindow = MultiPlayerWindow,
         RecommendSource = RecommendSource,
         AccentColor = AccentColor,
         SponsorBlockEnabled = SponsorBlockEnabled,
@@ -562,6 +613,35 @@ public class SettingsStore
         var next = QualityPreference.Normalize(qn);
         if (PreferredQualityQn == next) return;
         PreferredQualityQn = next;
+        Save();
+    }
+
+    /// <summary>
+    /// 改默认音量并落盘, 广播给已打开的播放器(正在播的立刻生效)与设置页(滑块跟着动)。
+    ///
+    /// ★ 同值短路不只是省磁盘: 播放器每次调音量都会调它(见 PlayerWindow.SetVolume),
+    ///   程序性回写(Playing 补写、事件触发后的同步)因此不会产生额外落盘, 调用方也不必判重。
+    /// ★ 不需要像画质那样"只影响下一次取流": 音量是即时生效的, 所以必须广播 ——
+    ///   用户在设置页拖滑杆时, 正在播的视频要跟着变(与弹幕设置同款语义)。
+    /// </summary>
+    public void SetDefaultVolume(int volume)
+    {
+        var v = Math.Clamp(volume, VolumeMin, VolumeMax);
+        if (DefaultVolume == v) return;
+        DefaultVolume = v;
+        Save();
+        VolumeChanged?.Invoke();
+    }
+
+    /// <summary>
+    /// 改"多个播放器窗口"并落盘。
+    /// ★ 不需要广播事件: 它只在**新建播放器窗口那一刻**被读(见 PlayerService.GetOrCreateWindow),
+    ///   已经开着的窗口不受影响 —— 与「默认画质」「免登录 1080P」同款, 下次播放即按新值走。
+    /// </summary>
+    public void SetMultiPlayerWindow(bool value)
+    {
+        if (MultiPlayerWindow == value) return;
+        MultiPlayerWindow = value;
         Save();
     }
 
